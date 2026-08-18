@@ -27,6 +27,7 @@ RSS_URL = None  # RSS is dead (Kijiji removed feeds in 2024)
 SEARCH_URL = (
     "https://www.kijiji.ca/b-search.html"
     f"?searchKeyword={KEYWORD}"
+    f"&q={KEYWORD}"
     f"&address=Waterloo%2C+ON"
     f"&ll={CENTER_LAT}%2C{CENTER_LNG}"
     f"&radius={RADIUS_KM}"
@@ -117,8 +118,8 @@ def parse_feed(html_text):
         seen_ids.add(lid)
 
         title = str(node.get("title") or "").strip()
-        if not title:
-            continue
+        if not title or KEYWORD.lower() not in title.lower():
+            continue  # hard keyword filter: page may include unrelated modules
 
         url = node.get("url") or node.get("seoUrl") or ""
         if url and url.startswith("/"):
@@ -165,6 +166,9 @@ def db_connect():
         " title TEXT, price TEXT, url TEXT,"
         " distance_km REAL, seen_at TEXT)"
     )
+    conn.execute(
+        "DELETE FROM seen_listings WHERE title IS NOT NULL "
+        "AND lower(title) NOT LIKE '%' || ? || '%'", (KEYWORD.lower(),))
     conn.commit()
     return conn
 
