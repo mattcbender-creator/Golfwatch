@@ -23,8 +23,9 @@ POLL_SECONDS = 120
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "golfwatch.db")
 BLOCKLIST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blocklist.json")
 
-RSS_URL = (
-    "https://www.kijiji.ca/rss-srp/b-search.html"
+RSS_URL = None  # RSS is dead (Kijiji removed feeds in 2024)
+SEARCH_URL = (
+    "https://www.kijiji.ca/b-search.html"
     f"?searchKeyword={KEYWORD}"
     f"&address=Waterloo%2C+ON"
     f"&ll={CENTER_LAT}%2C{CENTER_LNG}"
@@ -32,17 +33,121 @@ RSS_URL = (
     "&sort=dateDesc"
 )
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
-    "Accept": "application/rss+xml, application/xml, text/xml, */*",
-}
+def _ensure_curl_cffi():
+    """Install curl_cffi at runtime (keeps the Railway start command simple)."""
+    try:
+        import curl_cffi  # noqa: F401
+        return True
+    except ImportError:
+        pass
+    import subprocess, sys
+    for pkg in ("curl-cffi", "curl_cffi"):
+        try:
+            print(f"installing {pkg}...", flush=True)
+            r = subprocess.run([sys.executable, "-m", "pip", "install",
+                                "--no-cache-dir", pkg],
+                               capture_output=True, text=True, timeout=300)
+            if r.returncode == 0:
+                print("curl_cffi installed", flush=True)
+                return True
+            print(f"pip {pkg} failed: {r.stderr[-500:]}", flush=True)
+        except Exception as e:
+            print(f"pip {pkg} error: {e}", flush=True)
+    return False
 
-GEORSS_NS = "{http://www.georss.org/georss}"
-DC_NS = "{http://purl.org/dc/elements/1.1/}"
+
+try:
+    if not _ensure_curl_cffi():
+        raise ImportError("curl_cffi unavailable")
+    from curl_cffi import requests as cf_requests
+    _session = cf_requests.Session()
+    def _get(url):
+        return _session.get(url, impersonate="chrome", timeout=25, headers={
+            "Accept-Language": "en-CA,en;q=0.9",
+            "Referer": "https://www.kijiji.ca/",
+        })
+except ImportError:
+    _session = requests.Session()
+    def _get(url):
+        return _session.get(url, timeout=25, headers=HEADERS)
 
 
-# ----------------- helpers -----------------
+def _walk(node, found):
+    """Recursively collect listing-like dicts from __NEXT_DATA__ JSON."""
+    if isinstance(node, dict):
+        keys = set(node.keys())
+        if ("title" in keys and ("id" in keys or "adId" in keys)
+                and ("price" in keys or "url" in keys or "seoUrl" in keys)):
+            found.append(node)
+        for v in node.values():
+            _walk(v, found)
+    elif isinstance(node, list):
+        for v in node:
+            _walk(v, found)
+
+
+def _num(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_feed(html_text):
+    """Yield listing dicts from the embedded Next.js JSON on the search page."""
+    m = re.search(
+        r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+        html_text, re.S)
+    if not m:
+        print("parse: __NEXT_DATA__ not found (page layout changed?)", flush=True)
+        return
+    try:
+        data = json.loads(m.group(1))
+    except json.JSONDecodeError as e:
+        print(f"parse: bad JSON in __NEXT_DATA__: {e}", flush=True)
+        return
+
+    found = []
+    _walk(data.get("props", data), found)
+    seen_ids = set()
+    for node in found:
+        lid = str(node.get("id") or node.get("adId") or "")
+        if not lid or lid in seen_ids:
+            continue
+        seen_ids.add(lid)
+
+        title = str(node.get("title") or "").strip()
+        if not title:
+            continue
+
+        url = node.get("url") or node.get("seoUrl") or ""
+        if url and url.startswith("/"):
+            url = "https://www.kijiji.ca" + url
+
+        price = node.get("price")
+        if isinstance(price, dict):
+            amt = price.get("amount")
+            price = f"${amt/100:,.2f}" if isinstance(amt, (int, float)) else \
+                    str(price.get("text") or "n/a")
+        elif isinstance(price, (int, float)):
+            price = f"${price/100:,.2f}" if price > 10000 else f"${price:,.2f}"
+        else:
+            price = str(price) if price else "n/a"
+
+        lat = lng = None
+        loc = node.get("location")
+        if isinstance(loc, dict):
+            coords = loc.get("coordinates") or loc
+            lat = _num(coords.get("latitude") if isinstance(coords, dict) else None)
+            lng = _num(coords.get("longitude") if isinstance(coords, dict) else None)
+
+        yield {
+            "id": lid, "title": title, "url": url, "price": price,
+            "lat": lat, "lng": lng,
+            "published": str(node.get("activationDate") or node.get("sortingDate") or ""),
+        }
+
+
 def haversine_km(lat1, lng1, lat2, lng2):
     r = 6371.0
     p1, p2 = math.radians(lat1), math.radians(lat2)
@@ -72,50 +177,6 @@ def load_blocklist():
         return []
 
 
-def listing_id_from_url(url):
-    # Kijiji URLs end in /<numeric id>
-    m = re.search(r"/(\d{6,})(?:\?|$)", url)
-    return m.group(1) if m else url
-
-
-def parse_feed(xml_text):
-    """Yield dicts: id, title, url, price, lat, lng, published."""
-    root = ElementTree.fromstring(xml_text)
-    for item in root.iter("item"):
-        title = (item.findtext("title") or "").strip()
-        url = (item.findtext("link") or "").strip()
-        desc = item.findtext("description") or ""
-        pub = item.findtext("pubDate") or item.findtext(f"{DC_NS}date") or ""
-
-        # price: Kijiji puts it in <g-core:price> sometimes, else in description
-        price = ""
-        for child in item:
-            if child.tag.lower().endswith("price") and child.text:
-                price = child.text.strip()
-        if not price:
-            m = re.search(r"\$[\d,]+(?:\.\d\d)?", desc)
-            price = m.group(0) if m else "n/a"
-
-        # coordinates via georss:point "lat lng"
-        lat = lng = None
-        point = item.findtext(f"{GEORSS_NS}point")
-        if point:
-            try:
-                lat, lng = (float(x) for x in point.split())
-            except ValueError:
-                pass
-
-        yield {
-            "id": listing_id_from_url(url),
-            "title": title,
-            "url": url,
-            "price": price,
-            "lat": lat,
-            "lng": lng,
-            "published": pub,
-        }
-
-
 def notify(listing, dist_txt):
     line = f"⛳ NEW: {listing['title']} — {listing['price']} — {dist_txt} — {listing['url']}"
     print(line, flush=True)
@@ -124,7 +185,7 @@ def notify(listing, dist_txt):
 # ----------------- main cycle -----------------
 def run_once(conn, blocklist, first_run=False):
     try:
-        resp = requests.get(RSS_URL, headers=HEADERS, timeout=20)
+        resp = _get(SEARCH_URL)
         resp.raise_for_status()
     except requests.RequestException as e:
         print(f"[{datetime.now():%H:%M:%S}] fetch failed: {e}", flush=True)
