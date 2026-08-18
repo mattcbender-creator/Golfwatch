@@ -23,17 +23,18 @@ POLL_SECONDS = 120
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "golfwatch.db")
 BLOCKLIST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blocklist.json")
 
-RSS_URL = None  # RSS is dead (Kijiji removed feeds in 2024)
-SEARCH_URL = (
+# Kijiji killed RSS (2024) and ignores keyword params on some endpoints,
+# so we try several known search-URL formats each poll and stick with
+# whichever one actually returns keyword-matching listings.
+SEARCH_URLS = [
+    f"https://www.kijiji.ca/b-buy-sell/kitchener-waterloo/{KEYWORD}/k0c10l1700212"
+    f"?sort=dateDesc&address=Waterloo%2C+ON&radius={RADIUS_KM}.0",
+    f"https://www.kijiji.ca/b-kitchener-waterloo/{KEYWORD}/k0l1700212?sort=dateDesc",
     "https://www.kijiji.ca/b-search.html"
-    f"?searchKeyword={KEYWORD}"
-    f"&q={KEYWORD}"
-    f"&address=Waterloo%2C+ON"
-    f"&ll={CENTER_LAT}%2C{CENTER_LNG}"
-    f"&radius={RADIUS_KM}"
-    "&sort=dateDesc"
-)
-
+    f"?searchKeyword={KEYWORD}&q={KEYWORD}&address=Waterloo%2C+ON"
+    f"&ll={CENTER_LAT}%2C{CENTER_LNG}&radius={RADIUS_KM}&sort=dateDesc",
+]
+_good_url_idx = [None]
 def _ensure_curl_cffi():
     """Install curl_cffi at runtime (keeps the Railway start command simple)."""
     try:
@@ -188,15 +189,30 @@ def notify(listing, dist_txt):
 
 # ----------------- main cycle -----------------
 def run_once(conn, blocklist, first_run=False):
-    try:
-        resp = _get(SEARCH_URL)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        print(f"[{datetime.now():%H:%M:%S}] fetch failed: {e}", flush=True)
+    order = list(range(len(SEARCH_URLS)))
+    if _good_url_idx[0] is not None:
+        order.remove(_good_url_idx[0])
+        order.insert(0, _good_url_idx[0])
+    listings_batch = None
+    for idx in order:
+        try:
+            resp = _get(SEARCH_URLS[idx])
+            resp.raise_for_status()
+        except Exception as e:
+            print(f"[{datetime.now():%H:%M:%S}] url{idx} fetch failed: {e}", flush=True)
+            continue
+        batch = list(parse_feed(resp.text))
+        print(f"[{datetime.now():%H:%M:%S}] url{idx} -> {len(batch)} '{KEYWORD}' listings", flush=True)
+        if batch:
+            _good_url_idx[0] = idx
+            listings_batch = batch
+            break
+    if listings_batch is None:
+        print(f"[{datetime.now():%H:%M:%S}] no URL format returned matches this cycle", flush=True)
         return
 
     new_count = 0
-    for listing in parse_feed(resp.text):
+    for listing in listings_batch:
         cur = conn.execute(
             "SELECT 1 FROM seen_listings WHERE listing_id=?", (listing["id"],)
         )
@@ -327,3 +343,4 @@ threading.Thread(target=poller, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
