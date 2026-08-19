@@ -1,0 +1,119 @@
+"""ResaleScout FB agent — runs on your virtual PC, pushes listings to /ingest.
+
+Why it lives here and not in the Railway container: Meta blocks datacenter
+ASNs on the first request, so the fetch has to leave from an IP that looks
+residential. This script does NOT log in — Marketplace's login modal overlays
+the public listings rather than gating them, so we just dismiss it. No account,
+no cookies, nothing to get banned.
+
+Setup on the VM (Ubuntu):
+    pip install camoufox[geoip] requests
+    python -m camoufox fetch
+    export INGEST_URL=https://golfwatch-live-production.up.railway.app/ingest
+    export INGEST_TOKEN=<same token as the Railway var>
+    export PROXY="http://user:pass@residential-endpoint:port"   # recommended
+    python fb_agent.py
+
+Run it on a loop with cron/systemd, e.g. every 10 minutes.
+"""
+import os, json, time, random, sys
+import requests
+
+INGEST_URL   = os.environ["INGEST_URL"]
+INGEST_TOKEN = os.environ["INGEST_TOKEN"]
+PROXY        = os.environ.get("PROXY", "")
+CITY         = os.environ.get("FB_CITY", "kitchener-waterloo")
+RADIUS_KM    = os.environ.get("RADIUS_KM", "40")
+KEYWORDS     = [k.strip() for k in os.environ.get(
+                   "KEYWORDS", "golf,video games,lego,iphone").split(",") if k.strip()]
+MAX_PRICE    = os.environ.get("MAX_PRICE_CAD", "600")
+HEADLESS     = os.environ.get("HEADLESS", "0") == "1"   # headful survives longer
+
+
+def harvest(page, keyword):
+    """Collect listings out of the GraphQL/XHR payloads the page fetches.
+    Parsing captured JSON beats parsing the DOM: Meta reshuffles and obfuscates
+    class names constantly, but the data shape is comparatively stable."""
+    found = {}
+
+    def on_response(resp):
+        if "/api/graphql" not in resp.url:
+            return
+        try:
+            data = resp.json()
+        except Exception:
+            return
+        stack = [data]
+        while stack:
+            n = stack.pop()
+            if isinstance(n, dict):
+                if n.get("__typename") == "GroupCommerceProductItem" or (
+                        n.get("marketplace_listing_title") and n.get("id")):
+                    price = ((n.get("listing_price") or {}).get("amount")
+                             or (n.get("listing_price") or {}).get("formatted_amount"))
+                    loc = ((n.get("location") or {}).get("reverse_geocode") or {})
+                    coords = (n.get("location") or {}).get("latitude") and n["location"] or {}
+                    found[n["id"]] = {
+                        "id": n["id"],
+                        "title": n.get("marketplace_listing_title"),
+                        "price": price,
+                        "url": f"https://www.facebook.com/marketplace/item/{n['id']}",
+                        "latitude": coords.get("latitude") or loc.get("latitude"),
+                        "longitude": coords.get("longitude") or loc.get("longitude"),
+                    }
+                stack.extend(n.values())
+            elif isinstance(n, list):
+                stack.extend(n)
+
+    page.on("response", on_response)
+    url = (f"https://www.facebook.com/marketplace/{CITY}/search?"
+           f"query={keyword.replace(' ', '%20')}&radius={RADIUS_KM}"
+           f"&maxPrice={MAX_PRICE}&sortBy=creation_time_descend&exact=false")
+    page.goto(url, wait_until="domcontentloaded", timeout=90_000)
+    time.sleep(random.uniform(3, 6))
+
+    for sel in ('div[aria-label="Close"]', 'div[aria-label="Fermer"]'):
+        try:
+            page.click(sel, timeout=3000)
+            break
+        except Exception:
+            pass
+
+    # human-ish scrolling: speed is what gets you flagged, not volume
+    for _ in range(6):
+        page.mouse.wheel(0, random.randint(600, 1100))
+        time.sleep(random.uniform(1.2, 2.8))
+
+    page.remove_listener("response", on_response)
+    return list(found.values())
+
+
+def push(listings, keyword):
+    r = requests.post(INGEST_URL, timeout=60,
+                      headers={"X-Ingest-Token": INGEST_TOKEN},
+                      json={"keyword": keyword, "listings": listings})
+    r.raise_for_status()
+    return r.json()
+
+
+def main():
+    from camoufox.sync_api import Camoufox          # stealth-patched Firefox
+    opts = {"headless": HEADLESS, "humanize": True, "os": "windows",
+            "geoip": bool(PROXY)}
+    if PROXY:
+        opts["proxy"] = {"server": PROXY}
+    with Camoufox(**opts) as browser:
+        page = browser.new_page()
+        for kw in KEYWORDS:
+            try:
+                items = harvest(page, kw)
+                res = push(items, kw)
+                print(f"{kw}: scraped {len(items)}, ingested {res['new']} new, "
+                      f"deals {res.get('deals')}", flush=True)
+            except Exception as e:
+                print(f"{kw}: FAILED {e}", file=sys.stderr, flush=True)
+            time.sleep(random.uniform(20, 45))       # pace between keywords
+
+
+if __name__ == "__main__":
+    main()
