@@ -1,0 +1,16 @@
+FROM python:3.12-slim
+
+# Camoufox needs a handful of X/GTK libs to launch its patched Firefox headless.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgtk-3-0 libx11-xcb1 libasound2 libdbus-glib-1-2 libxtst6 \
+    libxrandr2 libgbm1 fonts-liberation ca-certificates wget \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir "camoufox[geoip]" requests
+
+# download the patched Firefox binary at build time so boot is fast
+RUN python -m camoufox fetch
+
+COPY fb_service.py /app/fb_service.py
+WORKDIR /app
+CMD ["python", "fb_service.py"]
