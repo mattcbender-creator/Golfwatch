@@ -56,7 +56,9 @@ _source_status = {}
 
 # ---------------------------------------------------------------- storage
 def db():
-    c = sqlite3.connect(DB, timeout=15)
+    c = sqlite3.connect(DB, timeout=30)
+    c.execute("PRAGMA journal_mode=WAL")      # readers don't block the writer
+    c.execute("PRAGMA busy_timeout=30000")    # wait instead of failing instantly
     c.execute("""CREATE TABLE IF NOT EXISTS listings(
         uid TEXT PRIMARY KEY, source TEXT, kw TEXT, title TEXT, price_num REAL,
         price TEXT, url TEXT, lat REAL, lng REAL, dist_km REAL, seen_at TEXT,
@@ -330,22 +332,39 @@ def push_notify(item):
 
 
 def save(items):
-    """Score + persist unseen listings. Returns the new ones."""
-    con, fresh = db(), []
-    for it in items:
-        if not keep(it):
-            continue
-        if con.execute("SELECT 1 FROM listings WHERE uid=?", (it["uid"],)).fetchone():
-            continue
+    """Score + persist unseen listings. Returns the new ones.
+
+    The DB connection is NEVER held open across an AI call — DeepSeek takes
+    seconds per listing, and holding the write lock that long made every other
+    request (including /subscribe) fail with 'database is locked'."""
+    # phase 1: short read to find what's genuinely new
+    con = db()
+    seen = {r[0] for r in con.execute("SELECT uid FROM listings")}
+    con.close()
+
+    candidates = [it for it in items if keep(it) and it["uid"] not in seen]
+
+    # phase 2: the slow part, with no connection open
+    for it in candidates:
         score(it)
         it["seen_at"] = datetime.datetime.now(datetime.UTC).isoformat()
-        con.execute("""INSERT OR REPLACE INTO listings VALUES
-            (:uid,:source,:kw,:title,:price_num,:price,:url,:lat,:lng,:dist_km,
-             :seen_at,:est_cad,:margin_pct,:profit_cad,:deal,:confidence,:speed,:reason)""",
-            {k: it.get(k) for k in ("uid source kw title price_num price url lat lng "
-                                    "dist_km seen_at est_cad margin_pct profit_cad deal "
-                                    "confidence speed reason").split()})
-        fresh.append(it)
+
+    # phase 3: one short write
+    fresh = []
+    if candidates:
+        con = db()
+        for it in candidates:
+            con.execute("""INSERT OR REPLACE INTO listings VALUES
+                (:uid,:source,:kw,:title,:price_num,:price,:url,:lat,:lng,:dist_km,
+                 :seen_at,:est_cad,:margin_pct,:profit_cad,:deal,:confidence,:speed,:reason)""",
+                {k: it.get(k) for k in ("uid source kw title price_num price url lat lng "
+                                        "dist_km seen_at est_cad margin_pct profit_cad deal "
+                                        "confidence speed reason").split()})
+            fresh.append(it)
+        con.commit(); con.close()
+
+    # phase 4: notify after the write is durable
+    for it in fresh:
         try:
             push_notify(it)
         except Exception as e:
@@ -354,7 +373,6 @@ def save(items):
             print(f"DEAL {it['source']} {it['title'][:60]} {it['price']} "
                   f"-> est ${it['est_cad']:,.0f} ({it['margin_pct']:.0f}%) {it['url']}",
                   flush=True)
-    con.commit(); con.close()
     return fresh
 
 # ---------------------------------------------------------------- poller
