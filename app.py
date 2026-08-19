@@ -23,7 +23,23 @@ import requests as preq
 
 # ---------------------------------------------------------------- config
 KEYWORDS      = [k.strip() for k in os.environ.get(
-                    "KEYWORDS", "golf,video games,lego,iphone").split(",") if k.strip()]
+                    "KEYWORDS", "golf").split(",") if k.strip()]
+
+# Realistic KW-area secondhand ceilings by golf category. The model kept
+# returning ~$300 for everything; these cap the damage when it over-reaches.
+CATEGORY_CAPS = {
+    "book": 15, "media": 15, "accessory": 30, "apparel": 40, "balls": 35,
+    "shoes": 60, "gloves": 20, "training_aid": 70, "single_club": 120,
+    "bag": 160, "putter": 250, "wedge": 150, "hybrid": 180, "fairway_wood": 200,
+    "driver": 400, "iron_set": 500, "full_set": 800, "push_cart": 250,
+    "electric_cart": 900, "launch_monitor": 900, "simulator": 1500,
+    "rangefinder": 300, "other": 200,
+}
+# Brands that actually hold resale value; anything else gets the plain cap.
+PREMIUM_BRANDS = ("titleist", "scotty cameron", "taylormade", "callaway", "ping",
+                  "mizuno", "srixon", "cobra", "cleveland", "odyssey", "bettinardi",
+                  "footjoy", "sun mountain", "clicgear", "bushnell", "garmin",
+                  "trackman", "skytrak", "pxg", "vessel", "miura")
 CENTER_LAT    = float(os.environ.get("CENTER_LAT", 43.4643))     # Waterloo, ON
 CENTER_LNG    = float(os.environ.get("CENTER_LNG", -80.5204))
 RADIUS_KM     = float(os.environ.get("RADIUS_KM", 40))
@@ -63,7 +79,7 @@ def db():
         uid TEXT PRIMARY KEY, source TEXT, kw TEXT, title TEXT, price_num REAL,
         price TEXT, url TEXT, lat REAL, lng REAL, dist_km REAL, seen_at TEXT,
         est_cad REAL, margin_pct REAL, profit_cad REAL, deal INTEGER,
-        confidence TEXT, speed TEXT, reason TEXT)""")
+        confidence TEXT, speed TEXT, reason TEXT, category TEXT, brand TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS subs(
         endpoint TEXT PRIMARY KEY, sub TEXT, added TEXT)""")
     return c
@@ -219,28 +235,48 @@ def fetch_facebook(kw):
 SOURCES = {"kijiji": fetch_kijiji, "facebook": fetch_facebook}
 
 # ---------------------------------------------------------------- AI valuation
+JUNK_RE = re.compile(r"\b(book|encyclopedia|magazine|dvd|poster|calendar|card|"
+                     r"sticker|tee time|lesson|membership|green fee|towel|"
+                     r"keychain|trophy|ball marker|divot)\b", re.I)
+
 def ai_value(title, price):
     if not OPENROUTER_API_KEY or price is None:
         return {}
+    if JUNK_RE.search(title):                 # don't spend a call on $5 ephemera
+        return {"category": "book", "est_resale_cad": min(price, 15),
+                "confidence": "high", "flip": False, "brand": "",
+                "reason": "printed/novelty item, negligible resale"}
     prompt = (
-        f'You price used goods for resale in Kitchener-Waterloo, Ontario.\n'
-        f'Listing: "{title}" — asking CAD ${price:,.2f}\n\n'
-        f'Estimate what THIS item realistically sells for secondhand locally within '
-        f'30 days, net of nothing (gross sale price). Rules:\n'
-        f'- Value the exact item named. Do not assume a better model, a full set, or '
-        f'extra pieces that are not in the title.\n'
-        f'- Most used items resell for $10-60. Books, magazines, DVDs, single '
-        f'accessories, worn clothing and worn shoes are usually $5-20 and are rarely '
-        f'worth flipping. Do not inflate them.\n'
-        f'- Only name a high value for items with genuine resale demand: name-brand '
-        f'club sets, modern consoles, sealed or retired LEGO sets, recent phones.\n'
-        f'- If the title is vague, generic, or you cannot identify the product, set '
-        f'confidence low and estimate near the asking price.\n'
-        f'- est_resale_cad must be your CONSERVATIVE figure (the low end of what you '
-        f'would confidently expect), not a best case.\n'
-        f'- flip is true only if the item is worth the effort of buying and reselling.\n\n'
+        f'You are a golf equipment reseller in Kitchener-Waterloo, Ontario. Price '
+        f'this used listing for resale.\n\n'
+        f'Listing: "{title}"\nAsking: CAD ${price:,.2f}\n\n'
+        f'Classify it, then estimate what it realistically sells for used locally '
+        f'within 30 days.\n'
+        f'category must be one of: driver, fairway_wood, hybrid, iron_set, wedge, '
+        f'putter, single_club, full_set, bag, push_cart, electric_cart, shoes, '
+        f'apparel, gloves, balls, rangefinder, launch_monitor, simulator, '
+        f'training_aid, accessory, book, media, other.\n\n'
+        f'Typical used KW prices, for calibration:\n'
+        f'- Used balls by the dozen $8-25; gloves/tees/towels under $20\n'
+        f'- Beginner or unbranded single irons/woods $15-40\n'
+        f'- Recent brand-name driver (last 5 yrs) $120-350; older $40-90\n'
+        f'- Brand-name iron set (last 8 yrs) $150-450; old blades or beginner sets $60-150\n'
+        f'- Scotty Cameron / Bettinardi putters $250-600; ordinary putters $25-80\n'
+        f'- Stand/cart bags $40-140; Clicgear-type push carts $100-220\n'
+        f'- Full beginner package sets $80-200; premium full sets $300-700\n'
+        f'- Rangefinders $80-250; SkyTrak/launch monitors $400-900\n\n'
+        f'Rules:\n'
+        f'- Price the EXACT item named. Never assume a newer model, a complete set, '
+        f'or accessories not stated.\n'
+        f'- Unbranded, vintage, worn, or vague listings are near-worthless: estimate '
+        f'at or below the asking price and set confidence low.\n'
+        f'- Model year matters enormously. If no model is named, assume old and cheap.\n'
+        f'- est_resale_cad is your CONSERVATIVE figure (what you are confident it '
+        f'clears), est_high_cad your optimistic one. They must differ.\n'
+        f'- flip is true only if you would personally buy this to resell.\n\n'
         f'Reply ONLY minified JSON, no markdown:\n'
-        f'{{"est_resale_cad": <number>, "est_high_cad": <number>, '
+        f'{{"category": "<one of the list>", "brand": "<brand or empty>", '
+        f'"est_resale_cad": <number>, "est_high_cad": <number>, '
         f'"confidence": "high"|"medium"|"low", "speed": "fast"|"slow", '
         f'"flip": true|false, "reason": "<max 14 words, name the comparable>"}}')
     try:
@@ -256,6 +292,19 @@ def ai_value(title, price):
         print(f"ai error: {e}", flush=True)
         return {}
 
+def cap_estimate(est, category, title, confidence):
+    """Clamp the model's number to what the category can actually fetch here."""
+    cap = CATEGORY_CAPS.get((category or "other").lower(), CATEGORY_CAPS["other"])
+    # a brand premium is real on hard goods, not on worn shoes or used balls
+    BRANDABLE = {"driver", "fairway_wood", "hybrid", "iron_set", "wedge", "putter",
+                 "single_club", "full_set", "bag", "push_cart", "electric_cart",
+                 "rangefinder", "launch_monitor", "simulator"}
+    premium = (any(b in title.lower() for b in PREMIUM_BRANDS)
+               and (category or "").lower() in BRANDABLE)
+    if premium and confidence == "high":
+        cap *= 1.5                      # a real Scotty can beat the generic ceiling
+    return (min(est, cap), cap) if est else (est, cap)
+
 def score(item):
     """AI value + deal maths. Mutates and returns item."""
     p = item.get("price_num")
@@ -264,16 +313,21 @@ def score(item):
     item["confidence"] = str(obj.get("confidence", "")).lower()
     item["speed"] = str(obj.get("speed", "")).lower()
     item["reason"] = obj.get("reason", "")
-    item["est_cad"] = float(est) if isinstance(est, (int, float)) else None
+    item["category"] = str(obj.get("category", "")).lower()
+    item["brand"] = obj.get("brand", "")
+    est = float(est) if isinstance(est, (int, float)) else None
+    est, cap = cap_estimate(est, item["category"], item["title"], item["confidence"])
+    if est is not None and est != obj.get("est_resale_cad"):
+        item["reason"] = (item["reason"] + f" · capped at {item['category']} ceiling")[:90]
+    item["est_cad"] = est
     flip = obj.get("flip", True)
     if item["est_cad"] and p:
         item["profit_cad"] = item["est_cad"] - p
         item["margin_pct"] = (item["est_cad"] - p) / p * 100 if p else None
-        # percentage alone is meaningless on cheap items: $2 -> $6 is 200% and
-        # not worth driving for. Require real dollars AND the model's verdict.
+        # dollars first: percentage on a cheap item is noise, not opportunity
         item["deal"] = int(bool(flip)
-                           and item["margin_pct"] >= MIN_MARGIN_PCT
                            and item["profit_cad"] >= MIN_PROFIT_CAD
+                           and item["margin_pct"] >= MIN_MARGIN_PCT
                            and item["confidence"] != "low")
     else:
         item["profit_cad"] = item["margin_pct"] = None
@@ -356,10 +410,10 @@ def save(items):
         for it in candidates:
             con.execute("""INSERT OR REPLACE INTO listings VALUES
                 (:uid,:source,:kw,:title,:price_num,:price,:url,:lat,:lng,:dist_km,
-                 :seen_at,:est_cad,:margin_pct,:profit_cad,:deal,:confidence,:speed,:reason)""",
+                 :seen_at,:est_cad,:margin_pct,:profit_cad,:deal,:confidence,:speed,:reason,:category,:brand)""",
                 {k: it.get(k) for k in ("uid source kw title price_num price url lat lng "
                                         "dist_km seen_at est_cad margin_pct profit_cad deal "
-                                        "confidence speed reason").split()})
+                                        "confidence speed reason category brand").split()})
             fresh.append(it)
         con.commit(); con.close()
 
@@ -468,7 +522,7 @@ li{padding:12px;border:1px solid #232733;border-radius:10px;margin:8px 0;backgro
 li.deal{border-color:#f5a524;background:#1d1a12}a{color:#e8eaed;text-decoration:none;font-weight:600}
 .meta{color:#8b93a7;font-size:12px;margin-top:5px}.tag{font-size:11px;padding:2px 6px;border-radius:5px;
 background:#232733;color:#a9b1c6;margin-right:5px}.fb{background:#1b3a5c;color:#8ec5ff}
-.est{color:#4ade80}</style>
+.est{color:#4ade80;font-weight:600}.dim{color:#8b93a7}</style>
 <header><h1>💰 ResaleScout</h1><div class=sub>{{count}} tracked · {{deals}} 🔥 ·
 {{keywords}} · under ${{maxprice}} · {{radius}}km · last {{last_check or '—'}}<br>
 {% for s,v in status.items() %}<span class=tag>{{s}}: {{v[:40]}}</span>{% endfor %}<br>
@@ -498,17 +552,18 @@ btn.onclick=async()=>{
 <ul>{% for l in listings %}<li class="{{'deal' if l.deal}}">
 <a href="{{l.url}}" target=_blank>{{'🔥 ' if l.deal}}{{l.title}}</a>
 <div class=meta><span class="tag {{'fb' if l.source=='facebook'}}">{{l.source}}</span>
-<b>{{l.price}}</b>{% if l.est %} → <span class=est>est ${{l.est}}</span>
-({{l.margin}}%{% if l.confidence %}, {{l.confidence}} conf{% endif %}
-{%- if l.speed %}, {{l.speed}}{% endif %}){% endif %}
+<b>{{l.price}}</b>{% if l.profit %} · <span class=est>+${{l.profit}} profit</span>{% endif %}
+{% if l.est %} <span class=dim>(est ${{l.est}}, {{l.margin}}%{% if l.confidence %},
+{{l.confidence}} conf{% endif %}){% endif %}
+{% if l.category %}<span class=tag>{{l.category}}</span>{% endif %}
 {% if l.dist %} · {{l.dist}}{% endif %}</div>
 {% if l.reason %}<div class=meta>{{l.reason}}</div>{% endif %}</li>{% endfor %}</ul>"""
 
 @app.get("/")
 def home():
     con = db()
-    rows = con.execute("""SELECT * FROM listings ORDER BY deal DESC, profit_cad DESC,
-                          seen_at DESC LIMIT 80""").fetchall()
+    rows = con.execute("""SELECT * FROM listings ORDER BY deal DESC,
+                          COALESCE(profit_cad, -999) DESC, seen_at DESC LIMIT 80""").fetchall()
     cols = [d[0] for d in con.execute("SELECT * FROM listings LIMIT 1").description]
     con.close()
     out = []
@@ -517,6 +572,7 @@ def home():
         out.append({**d,
                     "est": f"{d['est_cad']:,.0f}" if d["est_cad"] else None,
                     "margin": f"{d['margin_pct']:.0f}" if d["margin_pct"] is not None else None,
+                    "profit": f"{d['profit_cad']:,.0f}" if d["profit_cad"] and d["profit_cad"] > 0 else None,
                     "dist": f"{d['dist_km']:.1f} km" if d["dist_km"] is not None else None})
     return render_template_string(PAGE, listings=out, radius=int(RADIUS_KM),
         keywords=" · ".join(KEYWORDS), last_check=_last_check, count=len(out),
