@@ -75,22 +75,34 @@ def haversine(lat, lng):
     a = math.sin(dp/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
     return 2 * r * math.asin(math.sqrt(a))
 
-def norm_price(v):
-    """Accepts 12345 (cents), '$123.45', 123.45 -> float dollars or None."""
+def norm_price(v, cents=False):
+    """Accepts 500 (cents), '$123.45', 123.45 -> float dollars or None.
+    Kijiji always sends integer cents, so the caller says so explicitly —
+    guessing by magnitude turned a $5 listing into $500."""
     if v is None:
         return None
     if isinstance(v, dict):
-        v = v.get("amount", v.get("value", v.get("amount_with_offset")))
+        if "amount" in v or "value" in v:
+            v = v.get("amount", v.get("value"))
+        elif "amount_with_offset" in v:
+            v, cents = v.get("amount_with_offset"), True
+        else:
+            return None
+    if v is None:
+        return None
     if isinstance(v, str):
         v = re.sub(r"[^\d.]", "", v)
         if not v:
             return None
-        return float(v)
-    v = float(v)
-    return v / 100.0 if v >= 10000 else v          # kijiji sends cents
+        return float(v)                      # strings are already dollars
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return None
+    return v / 100.0 if cents else v
 
-def mk(source, kw, title, price, url, lat=None, lng=None, uid=None):
-    p = norm_price(price)
+def mk(source, kw, title, price, url, lat=None, lng=None, uid=None, cents=False):
+    p = norm_price(price, cents=cents)
     d = haversine(lat, lng)
     return {"uid": uid or f"{source}:{url}", "source": source, "kw": kw,
             "title": (title or "").strip(), "price_num": p,
@@ -121,7 +133,7 @@ def parse_next_data(html, kw, source="kijiji"):
                 out.append(mk(source, kw, node["title"], node.get("price"),
                               u if u.startswith("http") else "https://www.kijiji.ca" + u,
                               co.get("latitude"), co.get("longitude"),
-                              uid=f"{source}:{node.get('id') or u}"))
+                              uid=f"{source}:{node.get('id') or u}", cents=True))
             stack.extend(node.values())
         elif isinstance(node, list):
             stack.extend(node)
@@ -208,15 +220,27 @@ SOURCES = {"kijiji": fetch_kijiji, "facebook": fetch_facebook}
 def ai_value(title, price):
     if not OPENROUTER_API_KEY or price is None:
         return {}
-    prompt = (f'Item listed locally in Ontario, Canada for CAD ${price:,.0f}: "{title}".\n'
-              f'Estimate the realistic CAD resale value on local classifieds within 30 days. '
-              f'Be skeptical: most listings are priced at or above market and are NOT flips. '
-              f'Only high margins backed by a clear reason (obviously underpriced, desirable '
-              f'model, complete bundle) deserve high confidence. If the title is too vague to '
-              f'value, say confidence low.\n\n'
-              f'Reply ONLY minified JSON, no markdown:\n'
-              f'{{"est_resale_cad": <number>, "confidence": "high"|"medium"|"low", '
-              f'"speed": "fast"|"slow", "reason": "<max 14 words, cite the comp logic>"}}')
+    prompt = (
+        f'You price used goods for resale in Kitchener-Waterloo, Ontario.\n'
+        f'Listing: "{title}" — asking CAD ${price:,.2f}\n\n'
+        f'Estimate what THIS item realistically sells for secondhand locally within '
+        f'30 days, net of nothing (gross sale price). Rules:\n'
+        f'- Value the exact item named. Do not assume a better model, a full set, or '
+        f'extra pieces that are not in the title.\n'
+        f'- Most used items resell for $10-60. Books, magazines, DVDs, single '
+        f'accessories, worn clothing and worn shoes are usually $5-20 and are rarely '
+        f'worth flipping. Do not inflate them.\n'
+        f'- Only name a high value for items with genuine resale demand: name-brand '
+        f'club sets, modern consoles, sealed or retired LEGO sets, recent phones.\n'
+        f'- If the title is vague, generic, or you cannot identify the product, set '
+        f'confidence low and estimate near the asking price.\n'
+        f'- est_resale_cad must be your CONSERVATIVE figure (the low end of what you '
+        f'would confidently expect), not a best case.\n'
+        f'- flip is true only if the item is worth the effort of buying and reselling.\n\n'
+        f'Reply ONLY minified JSON, no markdown:\n'
+        f'{{"est_resale_cad": <number>, "est_high_cad": <number>, '
+        f'"confidence": "high"|"medium"|"low", "speed": "fast"|"slow", '
+        f'"flip": true|false, "reason": "<max 14 words, name the comparable>"}}')
     try:
         r = preq.post("https://openrouter.ai/api/v1/chat/completions",
                       headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
@@ -239,10 +263,14 @@ def score(item):
     item["speed"] = str(obj.get("speed", "")).lower()
     item["reason"] = obj.get("reason", "")
     item["est_cad"] = float(est) if isinstance(est, (int, float)) else None
+    flip = obj.get("flip", True)
     if item["est_cad"] and p:
         item["profit_cad"] = item["est_cad"] - p
         item["margin_pct"] = (item["est_cad"] - p) / p * 100 if p else None
-        item["deal"] = int(item["margin_pct"] >= MIN_MARGIN_PCT
+        # percentage alone is meaningless on cheap items: $2 -> $6 is 200% and
+        # not worth driving for. Require real dollars AND the model's verdict.
+        item["deal"] = int(bool(flip)
+                           and item["margin_pct"] >= MIN_MARGIN_PCT
                            and item["profit_cad"] >= MIN_PROFIT_CAD
                            and item["confidence"] != "low")
     else:
@@ -310,7 +338,7 @@ def save(items):
         if con.execute("SELECT 1 FROM listings WHERE uid=?", (it["uid"],)).fetchone():
             continue
         score(it)
-        it["seen_at"] = datetime.datetime.utcnow().isoformat()
+        it["seen_at"] = datetime.datetime.now(datetime.UTC).isoformat()
         con.execute("""INSERT OR REPLACE INTO listings VALUES
             (:uid,:source,:kw,:title,:price_num,:price,:url,:lat,:lng,:dist_km,
              :seen_at,:est_cad,:margin_pct,:profit_cad,:deal,:confidence,:speed,:reason)""",
@@ -400,7 +428,7 @@ def subscribe():
         return jsonify(error="no endpoint"), 400
     con = db()
     con.execute("INSERT OR REPLACE INTO subs VALUES (?,?,?)",
-                (ep, json.dumps(sub), datetime.datetime.utcnow().isoformat()))
+                (ep, json.dumps(sub), datetime.datetime.now(datetime.UTC).isoformat()))
     con.commit(); con.close()
     print(f"push: subscribed {ep[:60]}", flush=True)
     return jsonify(ok=True)
