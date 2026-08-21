@@ -396,14 +396,14 @@ def push_notify(item):
         print("push: pywebpush not installed", flush=True)
         return
     body = item["price"]
+    if item.get("price_num") and (item.get("est_cad") or item.get("est_high_cad")):
+        body += f" → offer ~${item['price_num'] * (1 - HAGGLE_PCT / 100.0):,.0f}"
     if item.get("est_cad"):
-        body += f" → est ${item['est_cad']:,.0f}"
+        body += f" → resells ~${item['est_cad']:,.0f}"
         if item.get("est_high_cad") and item["est_high_cad"] > item["est_cad"]:
             body += f"–${item['est_high_cad']:,.0f}"
-        if item.get("margin_pct") is not None and item["margin_pct"] > 0:
-            body += f" ({item['margin_pct']:.0f}%)"
     elif item.get("est_high_cad"):
-        body += f" → up to ${item['est_high_cad']:,.0f}"
+        body += f" → resells up to ${item['est_high_cad']:,.0f}"
     if item.get("dist_km") is not None:
         body += f" · {item['dist_km']:.0f} km"
     payload = json.dumps({"title": ("🔥 " if item["deal"] else "") + item["title"][:60],
@@ -567,7 +567,7 @@ li.deal{border-color:#f5a524;background:#1d1a12}a{color:#e8eaed;text-decoration:
 .meta{color:#8b93a7;font-size:12px;margin-top:5px}.tag{font-size:11px;padding:2px 6px;border-radius:5px;
 background:#232733;color:#a9b1c6;margin-right:5px}.fb{background:#1b3a5c;color:#8ec5ff}
 .est{color:#4ade80;font-weight:600}.dim{color:#8b93a7}</style>
-<header><h1>💰 ResaleScout</h1><div class=sub>{{count}} worth ≥${{minprofit}} · {{total}} scanned · {{deals}} 🔥 ·
+<header><h1>💰 ResaleScout</h1><div class=sub>{{count}} worth ≥${{minprofit}} · {{total}} scanned · {{deals}} 🔥 · offers assume {{haggle}}% off ask ·
 {{keywords}} · under ${{maxprice}} · {{radius}}km · last {{last_check or '—'}}<br>
 {% for s,v in status.items() %}<span class=tag>{{s}}: {{v[:40]}}</span>{% endfor %}<br>
 <button id=nbtn>🔔 Alerts for {{pushkw}}</button></div></header>
@@ -596,9 +596,10 @@ btn.onclick=async()=>{
 <ul>{% for l in listings %}<li class="{{'deal' if l.deal}}">
 <a href="{{l.url}}" target=_blank>{{'🔥 ' if l.deal}}{{l.title}}</a>
 <div class=meta><span class="tag {{'fb' if l.source=='facebook'}}">{{l.source}}</span>
-<b>{{l.price}}</b>{% if l.profit %} · <span class=est>{{l.profit}}</span>{% endif %}
-{% if l.est %} <span class=dim>(resells ~${{l.est}}{% if l.confidence %},
-{{l.confidence}} conf{% endif %})</span>{% endif %}
+<b>{{l.price}}</b>{% if l.buy %} <span class=dim>→ offer ~${{l.buy}}</span>{% endif %}
+{% if l.est %} <span class=dim>→ resells ~${{l.est}}</span>{% endif %}
+{% if l.profit %} · <span class=est>{{l.profit}}</span>{% endif %}
+{% if l.confidence %} <span class=dim>({{l.confidence}} conf)</span>{% endif %}
 {% if l.category %}<span class=tag>{{l.category}}</span>{% endif %}
 {% if l.dist %} · {{l.dist}}{% endif %}</div>
 {% if l.reason %}<div class=meta>{{l.reason}}</div>{% endif %}</li>{% endfor %}</ul>"""
@@ -632,15 +633,21 @@ def home():
         e, eh = d["est_cad"], d.get("est_high_cad")
         est_disp = (f"{e:,.0f}–{eh:,.0f}" if e and eh and eh > e
                     else f"{(e or eh):,.0f}" if (e or eh) else None)
+        # the assumed haggled buy price — the middle step the maths runs on.
+        # safe to derive at render time: a HAGGLE_PCT change restarts the app,
+        # which rebuilds and rescores this table under the new value.
+        buy = (f"{d['price_num'] * (1 - HAGGLE_PCT / 100.0):,.0f}"
+               if d["price_num"] and est_disp else None)
         out.append({**d,
                     "est": est_disp,
+                    "buy": buy,
                     "profit": prof,
                     "dist": f"{d['dist_km']:.1f} km" if d["dist_km"] is not None else None})
     return render_template_string(PAGE, listings=out, radius=int(RADIUS_KM),
         keywords=" · ".join(KEYWORDS), last_check=_last_check, count=len(out),
         deals=sum(1 for o in out if o["deal"]), maxprice=int(MAX_PRICE_CAD),
         status=_source_status, vapid=VAPID_PUBLIC, pushkw=" · ".join(PUSH_KEYWORDS),
-        total=total, minprofit=int(SHOW_MIN_PROFIT))
+        total=total, minprofit=int(SHOW_MIN_PROFIT), haggle=int(HAGGLE_PCT))
 
 @app.get("/health")
 def health():
