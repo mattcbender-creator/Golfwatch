@@ -30,8 +30,12 @@ FB_CATEGORY  = os.environ.get("FB_CATEGORY", "sporting-goods")
 KEYWORDS     = [k.strip() for k in os.environ.get("KEYWORDS", "golf").split(",") if k.strip()]
 RADIUS_KM    = os.environ.get("RADIUS_KM", "60")
 MAX_PRICE    = os.environ.get("MAX_PRICE_CAD", "2000")
-POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "1200"))   # 20 min ≈ human refresh
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "3600"))
+# naps are drawn from [POLL_SECONDS, POLL_MAX_SECONDS] so cycles never land on
+# a predictable clock; default window is 1-1.8x the base
+POLL_MAX     = int(os.environ.get("POLL_MAX_SECONDS", str(int(POLL_SECONDS * 1.8))))
 HEADLESS     = os.environ.get("HEADLESS", "1") == "1"
+COOKIE_FILE  = os.environ.get("COOKIE_FILE", "/tmp/fb_session.json")
 
 # marketplace is login-walled for anonymous visitors. Session comes from ONE of:
 #   FB_COOKIES   "c_user=..; xs=.."  copied from a logged-in browser (preferred:
@@ -75,6 +79,27 @@ def fb_cookies():
             out.append({"name": k.strip(), "value": v.strip(),
                         "domain": ".facebook.com", "path": "/", "secure": True})
     return out
+
+
+def load_saved_session(ctx):
+    """Reuse the session from an earlier login. A fresh 'new device login'
+    every cycle is exactly what gets a burner account flagged."""
+    try:
+        with open(COOKIE_FILE) as f:
+            ctx.add_cookies(json.load(f))
+        print("facebook: restored saved session", flush=True)
+        return True
+    except Exception:
+        return False
+
+
+def save_session(ctx):
+    try:
+        with open(COOKIE_FILE, "w") as f:
+            json.dump(ctx.cookies("https://www.facebook.com"), f)
+        print("facebook: session saved for reuse", flush=True)
+    except Exception as e:
+        print(f"session save failed: {e}", flush=True)
 
 
 def _first_that_works(page, action, selectors, timeout=4000):
@@ -126,12 +151,18 @@ def cred_login(page):
     except Exception as e:
         print(f"login attempt failed: {e}", flush=True)
         return False
-    if any(w in page.url for w in ("checkpoint", "two_step", "/login")):
+    # the c_user cookie is the real signal — the URL can still read /login
+    # for a moment after a login that actually took
+    if any(c.get("name") == "c_user"
+           for c in page.context.cookies("https://www.facebook.com")):
+        print(f"facebook: logged in, landed on {page.url[:80]}", flush=True)
+        return True
+    if any(w in page.url for w in ("checkpoint", "two_step")):
         print(f"login CHALLENGED at {page.url[:110]} — log in once from a normal "
               f"browser, clear the challenge, then prefer FB_COOKIES", flush=True)
-        return False
-    print(f"facebook: logged in, landed on {page.url[:80]}", flush=True)
-    return True
+    else:
+        print(f"login did not take, landed on {page.url[:110]}", flush=True)
+    return False
 
 
 def harvest(page, keyword):
@@ -246,18 +277,31 @@ def one_cycle():
         if FB_COOKIES:
             ctx.add_cookies(fb_cookies())
             print("facebook: session cookies loaded", flush=True)
-        elif FB_EMAIL and FB_PASSWORD:
-            page = ctx.new_page()
-            try:
-                cred_login(page)
-            finally:
-                page.close()
-        else:
-            print("facebook: NO SESSION configured (FB_COOKIES or "
-                  "FB_EMAIL/FB_PASSWORD) — expect login walls", flush=True)
+        elif not load_saved_session(ctx):
+            if FB_EMAIL and FB_PASSWORD:
+                page = ctx.new_page()
+                try:
+                    if cred_login(page):
+                        save_session(ctx)
+                finally:
+                    page.close()
+            else:
+                print("facebook: NO SESSION configured (FB_COOKIES or "
+                      "FB_EMAIL/FB_PASSWORD) — expect login walls", flush=True)
         for kw in KEYWORDS:
             try:
                 items = harvest_with_retry(ctx, kw)
+                if not items and not FB_COOKIES and FB_EMAIL and FB_PASSWORD:
+                    # empty almost always means the saved session expired —
+                    # log in fresh once and retry (no-op if still logged in)
+                    page = ctx.new_page()
+                    try:
+                        ok = cred_login(page)
+                    finally:
+                        page.close()
+                    if ok:
+                        save_session(ctx)
+                        items = harvest_with_retry(ctx, kw)
                 res = push(items, kw)
                 print(f"{kw}: scraped {len(items)}, ingested {res.get('new')} new, "
                       f"deals {res.get('deals')}", flush=True)
@@ -278,9 +322,9 @@ def main():
         except Exception as e:
             print(f"cycle crashed: {e}", flush=True)
             traceback.print_exc()
-        nap = POLL_SECONDS + random.randint(-60, 90)
-        print(f"sleeping {nap}s", flush=True)
-        time.sleep(max(120, nap))
+        nap = random.randint(POLL_SECONDS, max(POLL_SECONDS + 60, POLL_MAX))
+        print(f"sleeping {nap}s (~{nap // 60} min)", flush=True)
+        time.sleep(max(300, nap))
 
 
 if __name__ == "__main__":
