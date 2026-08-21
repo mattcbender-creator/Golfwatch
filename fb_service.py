@@ -61,6 +61,7 @@ def proxy_ok():
 def harvest(page, keyword):
     """Pull listings out of the GraphQL/XHR JSON the page fetches, not the DOM."""
     found = {}
+    json_seen = [0]
 
     def on_response(resp):
         if "/api/graphql" not in resp.url and "/marketplace/" not in resp.url:
@@ -69,6 +70,7 @@ def harvest(page, keyword):
             data = resp.json()
         except Exception:
             return
+        json_seen[0] += 1
         stack = [data]
         while stack:
             n = stack.pop()
@@ -109,6 +111,13 @@ def harvest(page, keyword):
         time.sleep(random.uniform(1.3, 2.9))
 
     page.remove_listener("response", on_response)
+    # 0 results is ambiguous: no matches, or FB swapped the results for a
+    # login/checkpoint page. The landing URL is the tell.
+    end_url = page.url
+    if any(w in end_url for w in ("login", "checkpoint", "unsupported")):
+        print(f"{keyword}: BLOCKED — redirected to {end_url[:120]}", flush=True)
+    print(f"{keyword}: {len(found)} listings from {json_seen[0]} json responses, "
+          f"landed on {end_url[:120]}", flush=True)
     return list(found.values())
 
 
