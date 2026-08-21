@@ -47,6 +47,10 @@ POLL_SECONDS  = int(os.environ.get("POLL_SECONDS", 300))
 MAX_PRICE_CAD = float(os.environ.get("MAX_PRICE_CAD", 600))
 MIN_MARGIN_PCT= float(os.environ.get("MIN_MARGIN_PCT", 50))
 MIN_PROFIT_CAD= float(os.environ.get("MIN_PROFIT_CAD", 40))
+# assume a polite offer below asking lands — profit is figured on that,
+# not the sticker price. 10% is what reliably works locally; more only
+# happens on stale listings.
+HAGGLE_PCT    = min(max(float(os.environ.get("HAGGLE_PCT", 10)), 0), 50)
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 AI_MODEL      = os.environ.get("AI_MODEL", "deepseek/deepseek-chat")
@@ -324,8 +328,9 @@ def score(item):
     item["est_cad"] = est
     flip = obj.get("flip", True)
     if item["est_cad"] and p:
-        item["profit_cad"] = item["est_cad"] - p
-        item["margin_pct"] = (item["est_cad"] - p) / p * 100 if p else None
+        buy = round(p * (1 - HAGGLE_PCT / 100.0), 2)   # expected price after haggling
+        item["profit_cad"] = item["est_cad"] - buy
+        item["margin_pct"] = (item["est_cad"] - buy) / buy * 100 if buy else None
         # dollars first: percentage on a cheap item is noise, not opportunity
         item["deal"] = int(bool(flip)
                            and item["profit_cad"] >= MIN_PROFIT_CAD
