@@ -322,6 +322,13 @@ def one_cycle():
 
 def main():
     print("FB service starting", flush=True)
+    if os.environ.get("FB_PAUSED") == "1":
+        # parked on purpose (e.g. account needs human video verification).
+        # exits clean; with restart policy NEVER the service stays down until
+        # FB_PAUSED is cleared. Paid providers run through the main app instead.
+        print("FB_PAUSED=1 — scraper parked, exiting without touching Facebook",
+              flush=True)
+        return
     if not proxy_ok():
         print("proxy unusable — exiting so Railway restarts us", flush=True)
         sys.exit(1)
