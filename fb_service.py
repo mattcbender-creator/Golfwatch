@@ -35,7 +35,10 @@ POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "3600"))
 # a predictable clock; default window is 1-1.8x the base
 POLL_MAX     = int(os.environ.get("POLL_MAX_SECONDS", str(int(POLL_SECONDS * 1.8))))
 HEADLESS     = os.environ.get("HEADLESS", "1") == "1"
+# point COOKIE_FILE at a mounted volume so the session survives restarts —
+# a fresh 'new device' login email on every deploy is what we're avoiding
 COOKIE_FILE  = os.environ.get("COOKIE_FILE", "/tmp/fb_session.json")
+FB_SCROLLS   = max(1, int(os.environ.get("FB_SCROLLS", "14")))
 
 # marketplace is login-walled for anonymous visitors. Session comes from ONE of:
 #   FB_COOKIES   "c_user=..; xs=.."  copied from a logged-in browser (preferred:
@@ -228,7 +231,7 @@ def harvest(page, keyword):
             except Exception:
                 pass
 
-        for _ in range(6):                   # slow, human-ish scroll
+        for _ in range(FB_SCROLLS):          # slow, human-ish scroll
             page.mouse.wheel(0, random.randint(600, 1100))
             time.sleep(random.uniform(1.3, 2.9))
         break

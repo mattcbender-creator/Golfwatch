@@ -87,7 +87,8 @@ def db():
         uid TEXT PRIMARY KEY, source TEXT, kw TEXT, title TEXT, price_num REAL,
         price TEXT, url TEXT, lat REAL, lng REAL, dist_km REAL, seen_at TEXT,
         est_cad REAL, margin_pct REAL, profit_cad REAL, deal INTEGER,
-        confidence TEXT, speed TEXT, reason TEXT, category TEXT, brand TEXT)""")
+        confidence TEXT, speed TEXT, reason TEXT, category TEXT, brand TEXT,
+        est_high_cad REAL, profit_high_cad REAL)""")
     c.execute("""CREATE TABLE IF NOT EXISTS subs(
         endpoint TEXT PRIMARY KEY, sub TEXT, added TEXT)""")
     return c
@@ -335,24 +336,33 @@ def score(item):
     item["category"] = str(obj.get("category", "")).lower()
     item["brand"] = obj.get("brand", "")
     # a resale estimate at or below zero is model garbage, not a valuation
-    est = (float(est) if isinstance(est, (int, float))
-           and math.isfinite(est) and est > 0 else None)
+    def clean(v):
+        return (float(v) if isinstance(v, (int, float))
+                and math.isfinite(v) and v > 0 else None)
+    est, hi = clean(est), clean(obj.get("est_high_cad"))
     est, cap = cap_estimate(est, item["category"], item["title"], item["confidence"])
+    if hi is not None:
+        hi = min(hi, cap * 1.25)          # optimism gets a little headroom, not a pass
+        if est and hi < est:
+            hi = est
     if est is not None and est != obj.get("est_resale_cad"):
         item["reason"] = (item["reason"] + f" · capped at {item['category']} ceiling")[:90]
     item["est_cad"] = est
+    item["est_high_cad"] = hi
     flip = obj.get("flip", True)
-    if item["est_cad"] and p:
+    if p and (est or hi):
         buy = round(p * (1 - HAGGLE_PCT / 100.0), 2)   # expected price after haggling
-        item["profit_cad"] = item["est_cad"] - buy
-        item["margin_pct"] = (item["est_cad"] - buy) / buy * 100 if buy else None
-        # dollars first: percentage on a cheap item is noise, not opportunity
+        item["profit_cad"] = est - buy if est else None
+        item["profit_high_cad"] = (hi - buy) if hi else item["profit_cad"]
+        item["margin_pct"] = (est - buy) / buy * 100 if est and buy else None
+        # dollars first: percentage on a cheap item is noise, not opportunity.
+        # the 🔥 stays earned on the CONSERVATIVE number.
         item["deal"] = int(bool(flip)
-                           and item["profit_cad"] >= MIN_PROFIT_CAD
-                           and item["margin_pct"] >= MIN_MARGIN_PCT
+                           and (item["profit_cad"] or 0) >= MIN_PROFIT_CAD
+                           and (item["margin_pct"] or 0) >= MIN_MARGIN_PCT
                            and item["confidence"] != "low")
     else:
-        item["profit_cad"] = item["margin_pct"] = None
+        item["profit_cad"] = item["profit_high_cad"] = item["margin_pct"] = None
         item["deal"] = 0
     return item
 
@@ -374,8 +384,10 @@ def push_notify(item):
         return
     if PUSH_DEALS_ONLY and not item["deal"]:
         return
-    if item.get("profit_cad") is None or item["profit_cad"] < SHOW_MIN_PROFIT:
-        return                      # not provably profitable — don't wake the phone
+    best = max((v for v in (item.get("profit_cad"), item.get("profit_high_cad"))
+                if v is not None), default=None)
+    if best is None or best < SHOW_MIN_PROFIT:
+        return          # even the optimistic case misses the floor — stay quiet
     if not (VAPID_PUBLIC and VAPID_PRIVATE):
         return
     try:
@@ -386,8 +398,12 @@ def push_notify(item):
     body = item["price"]
     if item.get("est_cad"):
         body += f" → est ${item['est_cad']:,.0f}"
+        if item.get("est_high_cad") and item["est_high_cad"] > item["est_cad"]:
+            body += f"–${item['est_high_cad']:,.0f}"
         if item.get("margin_pct") is not None:
             body += f" ({item['margin_pct']:.0f}%)"
+    elif item.get("est_high_cad"):
+        body += f" → up to ${item['est_high_cad']:,.0f}"
     if item.get("dist_km") is not None:
         body += f" · {item['dist_km']:.0f} km"
     payload = json.dumps({"title": ("🔥 " if item["deal"] else "") + item["title"][:60],
@@ -436,10 +452,12 @@ def save(items):
         for it in candidates:
             con.execute("""INSERT OR REPLACE INTO listings VALUES
                 (:uid,:source,:kw,:title,:price_num,:price,:url,:lat,:lng,:dist_km,
-                 :seen_at,:est_cad,:margin_pct,:profit_cad,:deal,:confidence,:speed,:reason,:category,:brand)""",
+                 :seen_at,:est_cad,:margin_pct,:profit_cad,:deal,:confidence,:speed,:reason,:category,:brand,
+                 :est_high_cad,:profit_high_cad)""",
                 {k: it.get(k) for k in ("uid source kw title price_num price url lat lng "
                                         "dist_km seen_at est_cad margin_pct profit_cad deal "
-                                        "confidence speed reason category brand").split()})
+                                        "confidence speed reason category brand "
+                                        "est_high_cad profit_high_cad").split()})
             fresh.append(it)
         con.commit(); con.close()
 
@@ -578,7 +596,7 @@ btn.onclick=async()=>{
 <ul>{% for l in listings %}<li class="{{'deal' if l.deal}}">
 <a href="{{l.url}}" target=_blank>{{'🔥 ' if l.deal}}{{l.title}}</a>
 <div class=meta><span class="tag {{'fb' if l.source=='facebook'}}">{{l.source}}</span>
-<b>{{l.price}}</b>{% if l.profit %} · <span class=est>+${{l.profit}} profit</span>{% endif %}
+<b>{{l.price}}</b>{% if l.profit %} · <span class=est>{{l.profit}}</span>{% endif %}
 {% if l.est %} <span class=dim>(est ${{l.est}}, {{l.margin}}%{% if l.confidence %},
 {{l.confidence}} conf{% endif %}){% endif %}
 {% if l.category %}<span class=tag>{{l.category}}</span>{% endif %}
@@ -588,8 +606,11 @@ btn.onclick=async()=>{
 @app.get("/")
 def home():
     con = db()
-    rows = con.execute("""SELECT * FROM listings WHERE profit_cad >= ?
-                          ORDER BY deal DESC, profit_cad DESC, seen_at DESC
+    rows = con.execute("""SELECT * FROM listings
+                          WHERE MAX(COALESCE(profit_cad,-9e9), COALESCE(profit_high_cad,-9e9)) >= ?
+                          ORDER BY deal DESC,
+                                   MAX(COALESCE(profit_cad,-9e9), COALESCE(profit_high_cad,-9e9)) DESC,
+                                   seen_at DESC
                           LIMIT 200""", (SHOW_MIN_PROFIT,)).fetchall()
     cols = [d[0] for d in con.execute("SELECT * FROM listings LIMIT 1").description]
     total = con.execute("SELECT COUNT(*) FROM listings").fetchone()[0]
@@ -597,10 +618,21 @@ def home():
     out = []
     for r in rows:
         d = dict(zip(cols, r))
+        lo = d["profit_cad"] if d["profit_cad"] and d["profit_cad"] > 0 else None
+        hi = d.get("profit_high_cad")
+        hi = hi if hi and hi > 0 and (lo is None or hi > lo) else None
+        if lo and hi:
+            prof = f"+${lo:,.0f}–${hi:,.0f}"
+        elif lo:
+            prof = f"+${lo:,.0f} profit"
+        elif hi:
+            prof = f"up to +${hi:,.0f}"
+        else:
+            prof = None
         out.append({**d,
                     "est": f"{d['est_cad']:,.0f}" if d["est_cad"] else None,
                     "margin": f"{d['margin_pct']:.0f}" if d["margin_pct"] is not None else None,
-                    "profit": f"{d['profit_cad']:,.0f}" if d["profit_cad"] and d["profit_cad"] > 0 else None,
+                    "profit": prof,
                     "dist": f"{d['dist_km']:.1f} km" if d["dist_km"] is not None else None})
     return render_template_string(PAGE, listings=out, radius=int(RADIUS_KM),
         keywords=" · ".join(KEYWORDS), last_check=_last_check, count=len(out),
