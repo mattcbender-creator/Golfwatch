@@ -26,6 +26,7 @@ FB_PROXY     = os.environ["FB_PROXY"]
 INGEST_URL   = os.environ["INGEST_URL"]
 INGEST_TOKEN = os.environ["INGEST_TOKEN"]
 CITY         = os.environ.get("FB_CITY", "kitchener-waterloo")
+FB_CATEGORY  = os.environ.get("FB_CATEGORY", "sporting-goods")
 KEYWORDS     = [k.strip() for k in os.environ.get("KEYWORDS", "golf").split(",") if k.strip()]
 RADIUS_KM    = os.environ.get("RADIUS_KM", "60")
 MAX_PRICE    = os.environ.get("MAX_PRICE_CAD", "2000")
@@ -92,23 +93,33 @@ def harvest(page, keyword):
                 stack.extend(n)
 
     page.on("response", on_response)
-    url = (f"https://www.facebook.com/marketplace/{CITY}/search?"
-           f"query={keyword.replace(' ', '%20')}&radius={RADIUS_KM}"
-           f"&maxPrice={MAX_PRICE}&sortBy=creation_time_descend&exact=false")
-    page.goto(url, wait_until="domcontentloaded", timeout=90_000)
-    time.sleep(random.uniform(3, 6))
+    # Keyword search is login-walled for logged-out visitors; the category
+    # browse page often isn't. Try search first, fall back to browsing the
+    # category newest-first — the main app's keyword filter drops non-matches.
+    urls = [(f"https://www.facebook.com/marketplace/{CITY}/search?"
+             f"query={keyword.replace(' ', '%20')}&radius={RADIUS_KM}"
+             f"&maxPrice={MAX_PRICE}&sortBy=creation_time_descend&exact=false"),
+            (f"https://www.facebook.com/marketplace/{CITY}/{FB_CATEGORY}?"
+             f"maxPrice={MAX_PRICE}&sortBy=creation_time_descend&exact=false")]
+    for url in urls:
+        page.goto(url, wait_until="domcontentloaded", timeout=90_000)
+        time.sleep(random.uniform(3, 6))
+        if "/login" in page.url or "checkpoint" in page.url:
+            print(f"{keyword}: login wall at {url.split('?')[0]}", flush=True)
+            continue
 
-    for sel in ('div[aria-label="Close"]', 'div[aria-label="Fermer"]',
-                '[aria-label="Close"]'):
-        try:
-            page.click(sel, timeout=2500)
-            break
-        except Exception:
-            pass
+        for sel in ('div[aria-label="Close"]', 'div[aria-label="Fermer"]',
+                    '[aria-label="Close"]'):
+            try:
+                page.click(sel, timeout=2500)
+                break
+            except Exception:
+                pass
 
-    for _ in range(6):                       # slow, human-ish scroll
-        page.mouse.wheel(0, random.randint(600, 1100))
-        time.sleep(random.uniform(1.3, 2.9))
+        for _ in range(6):                   # slow, human-ish scroll
+            page.mouse.wheel(0, random.randint(600, 1100))
+            time.sleep(random.uniform(1.3, 2.9))
+        break
 
     page.remove_listener("response", on_response)
     # 0 results is ambiguous: no matches, or FB swapped the results for a
