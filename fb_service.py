@@ -30,8 +30,16 @@ FB_CATEGORY  = os.environ.get("FB_CATEGORY", "sporting-goods")
 KEYWORDS     = [k.strip() for k in os.environ.get("KEYWORDS", "golf").split(",") if k.strip()]
 RADIUS_KM    = os.environ.get("RADIUS_KM", "60")
 MAX_PRICE    = os.environ.get("MAX_PRICE_CAD", "2000")
-POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "600"))
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "1200"))   # 20 min ≈ human refresh
 HEADLESS     = os.environ.get("HEADLESS", "1") == "1"
+
+# marketplace is login-walled for anonymous visitors. Session comes from ONE of:
+#   FB_COOKIES   "c_user=..; xs=.."  copied from a logged-in browser (preferred:
+#                no login event ever fires, so nothing looks automated)
+#   FB_EMAIL / FB_PASSWORD           the scraper types the login form itself
+FB_COOKIES   = os.environ.get("FB_COOKIES", "").strip()
+FB_EMAIL     = os.environ.get("FB_EMAIL", "").strip()
+FB_PASSWORD  = os.environ.get("FB_PASSWORD", "")
 
 
 def proxy_cfg():
@@ -57,6 +65,40 @@ def proxy_ok():
     except Exception as e:
         print(f"proxy check FAILED: {e}", flush=True)
         return False
+
+
+def fb_cookies():
+    out = []
+    for part in FB_COOKIES.split(";"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            out.append({"name": k.strip(), "value": v.strip(),
+                        "domain": ".facebook.com", "path": "/", "secure": True})
+    return out
+
+
+def cred_login(page):
+    """Type the login form like a person would. Returns True on success."""
+    page.goto("https://www.facebook.com/login", wait_until="domcontentloaded",
+              timeout=90_000)
+    time.sleep(random.uniform(2, 4))
+    try:
+        page.fill("#email", FB_EMAIL)
+        time.sleep(random.uniform(0.6, 1.4))
+        page.fill("#pass", FB_PASSWORD)
+        time.sleep(random.uniform(0.6, 1.4))
+        page.click("button[name=login]")
+        page.wait_for_load_state("domcontentloaded", timeout=60_000)
+        time.sleep(random.uniform(3, 6))
+    except Exception as e:
+        print(f"login attempt failed: {e}", flush=True)
+        return False
+    if "checkpoint" in page.url or "/login" in page.url:
+        print(f"login CHALLENGED at {page.url[:110]} — log in once from a normal "
+              f"browser, clear the challenge, then prefer FB_COOKIES", flush=True)
+        return False
+    print("facebook: logged in", flush=True)
+    return True
 
 
 def harvest(page, keyword):
@@ -140,12 +182,12 @@ def push(listings, keyword):
     return r.json()
 
 
-def harvest_with_retry(browser, kw, tries=2):
+def harvest_with_retry(ctx, kw, tries=2):
     """Fresh page per attempt: after a renderer crash the old Page object is
     dead and every later call on it fails, so never reuse one across errors."""
     last = None
     for attempt in range(1, tries + 1):
-        page = browser.new_page()
+        page = ctx.new_page()
         try:
             return harvest(page, kw)
         except Exception as e:
@@ -165,9 +207,24 @@ def one_cycle():
     opts = {"headless": HEADLESS, "humanize": True, "os": "windows",
             "geoip": True, "proxy": proxy_cfg()}
     with Camoufox(**opts) as browser:
+        # one context for the whole cycle: cookies/login must outlive any
+        # single page, and browser.new_page() would isolate each one
+        ctx = browser.new_context()
+        if FB_COOKIES:
+            ctx.add_cookies(fb_cookies())
+            print("facebook: session cookies loaded", flush=True)
+        elif FB_EMAIL and FB_PASSWORD:
+            page = ctx.new_page()
+            try:
+                cred_login(page)
+            finally:
+                page.close()
+        else:
+            print("facebook: NO SESSION configured (FB_COOKIES or "
+                  "FB_EMAIL/FB_PASSWORD) — expect login walls", flush=True)
         for kw in KEYWORDS:
             try:
-                items = harvest_with_retry(browser, kw)
+                items = harvest_with_retry(ctx, kw)
                 res = push(items, kw)
                 print(f"{kw}: scraped {len(items)}, ingested {res.get('new')} new, "
                       f"deals {res.get('deals')}", flush=True)
