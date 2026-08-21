@@ -119,6 +119,12 @@ def cred_login(page):
         page.goto("https://www.facebook.com/login/", wait_until="domcontentloaded",
                   timeout=90_000)
         time.sleep(random.uniform(3, 5))
+        try:
+            # the form is injected by JS well after domcontentloaded; a blank
+            # shell with zero inputs is what an instant probe sees
+            page.wait_for_selector("input", timeout=25_000)
+        except Exception:
+            pass
         # a cookie-consent dialog overlays the form on some variants
         _first_that_works(page, lambda s, t: page.click(s, timeout=t), (
             'button[data-cookiebanner="accept_button"]',
