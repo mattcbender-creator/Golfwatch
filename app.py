@@ -400,7 +400,7 @@ def push_notify(item):
         body += f" → est ${item['est_cad']:,.0f}"
         if item.get("est_high_cad") and item["est_high_cad"] > item["est_cad"]:
             body += f"–${item['est_high_cad']:,.0f}"
-        if item.get("margin_pct") is not None:
+        if item.get("margin_pct") is not None and item["margin_pct"] > 0:
             body += f" ({item['margin_pct']:.0f}%)"
     elif item.get("est_high_cad"):
         body += f" → up to ${item['est_high_cad']:,.0f}"
@@ -597,8 +597,8 @@ btn.onclick=async()=>{
 <a href="{{l.url}}" target=_blank>{{'🔥 ' if l.deal}}{{l.title}}</a>
 <div class=meta><span class="tag {{'fb' if l.source=='facebook'}}">{{l.source}}</span>
 <b>{{l.price}}</b>{% if l.profit %} · <span class=est>{{l.profit}}</span>{% endif %}
-{% if l.est %} <span class=dim>(est ${{l.est}}, {{l.margin}}%{% if l.confidence %},
-{{l.confidence}} conf{% endif %}){% endif %}
+{% if l.est %} <span class=dim>(resells ~${{l.est}}{% if l.confidence %},
+{{l.confidence}} conf{% endif %})</span>{% endif %}
 {% if l.category %}<span class=tag>{{l.category}}</span>{% endif %}
 {% if l.dist %} · {{l.dist}}{% endif %}</div>
 {% if l.reason %}<div class=meta>{{l.reason}}</div>{% endif %}</li>{% endfor %}</ul>"""
@@ -622,16 +622,18 @@ def home():
         hi = d.get("profit_high_cad")
         hi = hi if hi and hi > 0 and (lo is None or hi > lo) else None
         if lo and hi:
-            prof = f"+${lo:,.0f}–${hi:,.0f}"
+            prof = f"+${lo:,.0f} to +${hi:,.0f} profit"
         elif lo:
             prof = f"+${lo:,.0f} profit"
         elif hi:
-            prof = f"up to +${hi:,.0f}"
+            prof = f"best case +${hi:,.0f}"   # conservative read doesn't profit
         else:
             prof = None
+        e, eh = d["est_cad"], d.get("est_high_cad")
+        est_disp = (f"{e:,.0f}–{eh:,.0f}" if e and eh and eh > e
+                    else f"{(e or eh):,.0f}" if (e or eh) else None)
         out.append({**d,
-                    "est": f"{d['est_cad']:,.0f}" if d["est_cad"] else None,
-                    "margin": f"{d['margin_pct']:.0f}" if d["margin_pct"] is not None else None,
+                    "est": est_disp,
                     "profit": prof,
                     "dist": f"{d['dist_km']:.1f} km" if d["dist_km"] is not None else None})
     return render_template_string(PAGE, listings=out, radius=int(RADIUS_KM),
