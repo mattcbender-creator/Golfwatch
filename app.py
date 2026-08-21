@@ -51,6 +51,10 @@ MIN_PROFIT_CAD= float(os.environ.get("MIN_PROFIT_CAD", 40))
 # not the sticker price. 10% is what reliably works locally; more only
 # happens on stale listings.
 HAGGLE_PCT    = min(max(float(os.environ.get("HAGGLE_PCT", 10)), 0), 50)
+# listings below this predicted profit are noise: hidden from the dashboard
+# and never pushed. Defaults to the deal floor.
+SHOW_MIN_PROFIT = float(os.environ.get("SHOW_MIN_PROFIT_CAD", MIN_PROFIT_CAD))
+KIJIJI_PAGES  = max(1, int(os.environ.get("KIJIJI_PAGES", 3)))
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 AI_MODEL      = os.environ.get("AI_MODEL", "deepseek/deepseek-chat")
@@ -132,9 +136,11 @@ def mk(source, kw, title, price, url, lat=None, lng=None, uid=None, cents=False)
             "url": url, "lat": lat, "lng": lng, "dist_km": d}
 
 # ---------------------------------------------------------------- kijiji
-def kijiji_url(kw):
+def kijiji_url(kw, page=1):
+    slug = quote_plus(kw.replace(' ', '-'))
+    tail = f"page-{page}/" if page > 1 else ""
     return ("https://www.kijiji.ca/b-buy-sell/kitchener-waterloo/"
-            f"{quote_plus(kw.replace(' ', '-'))}/k0c10l1700212")
+            f"{slug}/{tail}k0c10l1700212")
 
 def parse_next_data(html, kw, source="kijiji"):
     m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
@@ -164,8 +170,17 @@ def parse_next_data(html, kw, source="kijiji"):
 def fetch_kijiji(kw):
     if creq is None:
         raise RuntimeError("curl_cffi unavailable")
-    r = creq.get(kijiji_url(kw), impersonate="chrome", timeout=30)
-    return parse_next_data(r.text, kw)
+    out, seen = [], set()
+    for page in range(1, KIJIJI_PAGES + 1):
+        r = creq.get(kijiji_url(kw, page), impersonate="chrome", timeout=30)
+        got = [it for it in parse_next_data(r.text, kw) if it["uid"] not in seen]
+        if not got and page > 1:      # past the last page
+            break
+        seen.update(it["uid"] for it in got)
+        out.extend(got)
+        if page < KIJIJI_PAGES:
+            time.sleep(1.5)           # pace page pulls inside a cycle
+    return out
 
 # ---------------------------------------------------------------- facebook
 def _fb_normalise(items, kw):
@@ -359,8 +374,8 @@ def push_notify(item):
         return
     if PUSH_DEALS_ONLY and not item["deal"]:
         return
-    if item.get("profit_cad") is not None and item["profit_cad"] <= 0:
-        return                      # valued below asking — losing flips are noise
+    if item.get("profit_cad") is None or item["profit_cad"] < SHOW_MIN_PROFIT:
+        return                      # not provably profitable — don't wake the phone
     if not (VAPID_PUBLIC and VAPID_PRIVATE):
         return
     try:
@@ -534,7 +549,7 @@ li.deal{border-color:#f5a524;background:#1d1a12}a{color:#e8eaed;text-decoration:
 .meta{color:#8b93a7;font-size:12px;margin-top:5px}.tag{font-size:11px;padding:2px 6px;border-radius:5px;
 background:#232733;color:#a9b1c6;margin-right:5px}.fb{background:#1b3a5c;color:#8ec5ff}
 .est{color:#4ade80;font-weight:600}.dim{color:#8b93a7}</style>
-<header><h1>💰 ResaleScout</h1><div class=sub>{{count}} tracked · {{deals}} 🔥 ·
+<header><h1>💰 ResaleScout</h1><div class=sub>{{count}} worth ≥${{minprofit}} · {{total}} scanned · {{deals}} 🔥 ·
 {{keywords}} · under ${{maxprice}} · {{radius}}km · last {{last_check or '—'}}<br>
 {% for s,v in status.items() %}<span class=tag>{{s}}: {{v[:40]}}</span>{% endfor %}<br>
 <button id=nbtn>🔔 Alerts for {{pushkw}}</button></div></header>
@@ -573,9 +588,11 @@ btn.onclick=async()=>{
 @app.get("/")
 def home():
     con = db()
-    rows = con.execute("""SELECT * FROM listings ORDER BY deal DESC,
-                          COALESCE(profit_cad, -999) DESC, seen_at DESC LIMIT 80""").fetchall()
+    rows = con.execute("""SELECT * FROM listings WHERE profit_cad >= ?
+                          ORDER BY deal DESC, profit_cad DESC, seen_at DESC
+                          LIMIT 200""", (SHOW_MIN_PROFIT,)).fetchall()
     cols = [d[0] for d in con.execute("SELECT * FROM listings LIMIT 1").description]
+    total = con.execute("SELECT COUNT(*) FROM listings").fetchone()[0]
     con.close()
     out = []
     for r in rows:
@@ -588,7 +605,8 @@ def home():
     return render_template_string(PAGE, listings=out, radius=int(RADIUS_KM),
         keywords=" · ".join(KEYWORDS), last_check=_last_check, count=len(out),
         deals=sum(1 for o in out if o["deal"]), maxprice=int(MAX_PRICE_CAD),
-        status=_source_status, vapid=VAPID_PUBLIC, pushkw=" · ".join(PUSH_KEYWORDS))
+        status=_source_status, vapid=VAPID_PUBLIC, pushkw=" · ".join(PUSH_KEYWORDS),
+        total=total, minprofit=int(SHOW_MIN_PROFIT))
 
 @app.get("/health")
 def health():
