@@ -77,27 +77,60 @@ def fb_cookies():
     return out
 
 
+def _first_that_works(page, action, selectors, timeout=4000):
+    """FB serves several login page variants; probe selectors until one bites."""
+    for sel in selectors:
+        try:
+            action(sel, timeout)
+            return sel
+        except Exception:
+            continue
+    return None
+
+
 def cred_login(page):
     """Type the login form like a person would. Returns True on success."""
-    page.goto("https://www.facebook.com/login", wait_until="domcontentloaded",
-              timeout=90_000)
-    time.sleep(random.uniform(2, 4))
     try:
-        page.fill("#email", FB_EMAIL)
+        page.goto("https://www.facebook.com/login/", wait_until="domcontentloaded",
+                  timeout=90_000)
+        time.sleep(random.uniform(3, 5))
+        # a cookie-consent dialog overlays the form on some variants
+        _first_that_works(page, lambda s, t: page.click(s, timeout=t), (
+            'button[data-cookiebanner="accept_button"]',
+            'div[aria-label="Allow all cookies"]',
+            'button[title="Allow all cookies"]',
+            'div[aria-label="Autoriser tous les cookies"]'), 2500)
+        got = _first_that_works(
+            page, lambda s, t: page.fill(s, FB_EMAIL, timeout=t),
+            ('#email', 'input[name="email"]', 'input[type="email"]',
+             'input[autocomplete="username"]'))
+        if not got:
+            print(f"login page had no email field — {page.locator('input').count()} "
+                  f"inputs, title {page.title()!r}, url {page.url[:110]}", flush=True)
+            return False
         time.sleep(random.uniform(0.6, 1.4))
-        page.fill("#pass", FB_PASSWORD)
+        got = _first_that_works(
+            page, lambda s, t: page.fill(s, FB_PASSWORD, timeout=t),
+            ('#pass', 'input[name="pass"]', 'input[type="password"]',
+             'input[autocomplete="current-password"]'))
+        if not got:
+            print("login page had no password field", flush=True)
+            return False
         time.sleep(random.uniform(0.6, 1.4))
-        page.click("button[name=login]")
+        if not _first_that_works(page, lambda s, t: page.click(s, timeout=t), (
+                'button[name="login"]', '#loginbutton', 'button[type="submit"]',
+                'div[aria-label="Log in"]', 'div[aria-label="Log In"]')):
+            page.keyboard.press("Enter")
         page.wait_for_load_state("domcontentloaded", timeout=60_000)
         time.sleep(random.uniform(3, 6))
     except Exception as e:
         print(f"login attempt failed: {e}", flush=True)
         return False
-    if "checkpoint" in page.url or "/login" in page.url:
+    if any(w in page.url for w in ("checkpoint", "two_step", "/login")):
         print(f"login CHALLENGED at {page.url[:110]} — log in once from a normal "
               f"browser, clear the challenge, then prefer FB_COOKIES", flush=True)
         return False
-    print("facebook: logged in", flush=True)
+    print(f"facebook: logged in, landed on {page.url[:80]}", flush=True)
     return True
 
 
