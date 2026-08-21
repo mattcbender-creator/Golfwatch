@@ -19,6 +19,7 @@ Env vars:
   HEADLESS       1
 """
 import os, sys, json, time, random, traceback
+from urllib.parse import urlsplit
 import requests
 
 FB_PROXY     = os.environ["FB_PROXY"]
@@ -30,6 +31,18 @@ RADIUS_KM    = os.environ.get("RADIUS_KM", "60")
 MAX_PRICE    = os.environ.get("MAX_PRICE_CAD", "2000")
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "600"))
 HEADLESS     = os.environ.get("HEADLESS", "1") == "1"
+
+
+def proxy_cfg():
+    """Playwright ignores credentials embedded in the proxy URL — user:pass@host
+    silently becomes an unauthenticated proxy and every page load 407s. Split
+    them out into the username/password fields it actually reads."""
+    u = urlsplit(FB_PROXY)
+    cfg = {"server": f"{u.scheme or 'http'}://{u.hostname}:{u.port}"}
+    if u.username:
+        cfg["username"] = u.username
+        cfg["password"] = u.password or ""
+    return cfg
 
 
 def proxy_ok():
@@ -107,15 +120,34 @@ def push(listings, keyword):
     return r.json()
 
 
+def harvest_with_retry(browser, kw, tries=2):
+    """Fresh page per attempt: after a renderer crash the old Page object is
+    dead and every later call on it fails, so never reuse one across errors."""
+    last = None
+    for attempt in range(1, tries + 1):
+        page = browser.new_page()
+        try:
+            return harvest(page, kw)
+        except Exception as e:
+            last = e
+            print(f"{kw}: attempt {attempt}/{tries} failed: {e}", flush=True)
+            time.sleep(random.uniform(5, 10))
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
+    raise last
+
+
 def one_cycle():
     from camoufox.sync_api import Camoufox
     opts = {"headless": HEADLESS, "humanize": True, "os": "windows",
-            "geoip": True, "proxy": {"server": FB_PROXY}}
+            "geoip": True, "proxy": proxy_cfg()}
     with Camoufox(**opts) as browser:
-        page = browser.new_page()
         for kw in KEYWORDS:
             try:
-                items = harvest(page, kw)
+                items = harvest_with_retry(browser, kw)
                 res = push(items, kw)
                 print(f"{kw}: scraped {len(items)}, ingested {res.get('new')} new, "
                       f"deals {res.get('deals')}", flush=True)

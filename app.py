@@ -315,7 +315,9 @@ def score(item):
     item["reason"] = obj.get("reason", "")
     item["category"] = str(obj.get("category", "")).lower()
     item["brand"] = obj.get("brand", "")
-    est = float(est) if isinstance(est, (int, float)) else None
+    # a resale estimate at or below zero is model garbage, not a valuation
+    est = (float(est) if isinstance(est, (int, float))
+           and math.isfinite(est) and est > 0 else None)
     est, cap = cap_estimate(est, item["category"], item["title"], item["confidence"])
     if est is not None and est != obj.get("est_resale_cad"):
         item["reason"] = (item["reason"] + f" · capped at {item['category']} ceiling")[:90]
@@ -352,6 +354,8 @@ def push_notify(item):
         return
     if PUSH_DEALS_ONLY and not item["deal"]:
         return
+    if item.get("profit_cad") is not None and item["profit_cad"] <= 0:
+        return                      # valued below asking — losing flips are noise
     if not (VAPID_PUBLIC and VAPID_PRIVATE):
         return
     try:
@@ -361,7 +365,9 @@ def push_notify(item):
         return
     body = item["price"]
     if item.get("est_cad"):
-        body += f" → est ${item['est_cad']:,.0f} ({item['margin_pct']:.0f}%)"
+        body += f" → est ${item['est_cad']:,.0f}"
+        if item.get("margin_pct") is not None:
+            body += f" ({item['margin_pct']:.0f}%)"
     if item.get("dist_km") is not None:
         body += f" · {item['dist_km']:.0f} km"
     payload = json.dumps({"title": ("🔥 " if item["deal"] else "") + item["title"][:60],
