@@ -669,15 +669,14 @@ def peek():
             stack = [json.loads(m.group(1))]
             while stack:
                 n = stack.pop()
-                if isinstance(n, dict):
+                if isinstance(n, str):
+                    if "media.kijiji.ca" in n and n not in imgs:
+                        imgs.append(n)
+                elif isinstance(n, dict):
                     d = n.get("description")
                     if isinstance(d, str) and len(d) > 80 and (desc is None or len(d) > len(desc)):
                         desc = d
-                    for v in n.values():
-                        if isinstance(v, str) and "media.kijiji.ca" in v and v not in imgs:
-                            imgs.append(v)
-                        else:
-                            stack.append(v)
+                    stack.extend(n.values())
                 elif isinstance(n, list):
                     stack.extend(n)
         print(f"PEEK_DESC: {(desc or 'not found')[:2000]}", flush=True)
