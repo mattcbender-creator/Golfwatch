@@ -75,6 +75,9 @@ VAPID_PRIVATE = os.environ.get("VAPID_PRIVATE", "")
 VAPID_EMAIL   = os.environ.get("VAPID_EMAIL", "mailto:alerts@resalescout.local")
 
 DB = os.environ.get("DB_PATH", "/tmp/resalescout.db")
+# one-shot diagnostic: fetch this ad at boot, print its description and photos
+# (base64-chunked) to the logs for offline inspection. Cleared after use.
+PEEK_URL = os.environ.get("PEEK_URL", "").strip()
 _last_check = None
 _source_status = {}
 
@@ -654,6 +657,44 @@ def health():
     return jsonify(ok=True, sources=_source_status, last_check=_last_check,
                    fb_provider=FB_PROVIDER or None, ingest=bool(INGEST_TOKEN))
 
+def peek():
+    """Print PEEK_URL's ad description and photos into the logs."""
+    if not (PEEK_URL and creq):
+        return
+    try:
+        r = creq.get(PEEK_URL, impersonate="chrome", timeout=30)
+        m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', r.text, re.S)
+        desc, imgs = None, []
+        if m:
+            stack = [json.loads(m.group(1))]
+            while stack:
+                n = stack.pop()
+                if isinstance(n, dict):
+                    d = n.get("description")
+                    if isinstance(d, str) and len(d) > 80 and (desc is None or len(d) > len(desc)):
+                        desc = d
+                    for v in n.values():
+                        if isinstance(v, str) and "media.kijiji.ca" in v and v not in imgs:
+                            imgs.append(v)
+                        else:
+                            stack.append(v)
+                elif isinstance(n, list):
+                    stack.extend(n)
+        print(f"PEEK_DESC: {(desc or 'not found')[:2000]}", flush=True)
+        for i, u in enumerate(imgs[:3]):
+            print(f"PEEK_IMGURL {i}: {u}", flush=True)
+            try:
+                img = creq.get(u, impersonate="chrome", timeout=30).content[:400_000]
+                b64 = base64.b64encode(img).decode()
+                for j in range(0, len(b64), 1800):
+                    print(f"PEEKB64 {i} {j // 1800:04d} {b64[j:j + 1800]}", flush=True)
+                print(f"PEEKB64 {i} DONE {len(b64)}", flush=True)
+            except Exception as e:
+                print(f"PEEK img {i} failed: {e}", flush=True)
+    except Exception as e:
+        print(f"PEEK failed: {e}", flush=True)
+
+threading.Thread(target=peek, daemon=True).start()
 threading.Thread(target=poller, daemon=True).start()
 
 if __name__ == "__main__":
